@@ -1,0 +1,18 @@
+# PA2 LLM Alignment — Python Dependencies
+# Install on Colab with: pip install -r requirements.txt
+#
+# Pinned ranges instead of exact versions so Colab's pre-installed CUDA
+# stack stays compatible.
+
+torch>=2.1.0                   # core deep learning
+transformers>=4.40.0           # AutoModel*, AutoTokenizer, generation
+datasets>=2.18.0               # HuggingFace Datasets (HH-RLHF, GSM8K)
+peft>=0.10.0                   # LoRA via get_peft_model, disable_adapter ctx
+accelerate>=0.28.0             # device placement helpers (no Trainer!)
+bitsandbytes>=0.43.0           # 8-bit and 4-bit quantisation for frozen models
+sentencepiece>=0.1.99          # Llama tokenizer backend
+protobuf>=3.20.0               # required by sentencepiece
+tqdm>=4.66.0                   # progress bars
+numpy>=1.24.0
+scipy>=1.11.0                  # optional: stats for eval
+matplotlib>=3.7.0              # plotting reward distributions in eval

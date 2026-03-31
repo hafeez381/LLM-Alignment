@@ -1,0 +1,99 @@
+# ── Model checkpoints & weights ───────────────────────────────────────────────
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.gguf
+
+# HuggingFace model directories saved via save_pretrained()
+# (they contain config.json + model.safetensors / pytorch_model.bin)
+sft/
+sft_merged/
+rm/
+ppo/
+grpo/
+dpo/
+rlvr/
+
+
+# ── HuggingFace cache ─────────────────────────────────────────────────────────
+# Downloaded model weights and tokenizer files cached locally.
+# Can be re-downloaded from the Hub
+~/.cache/huggingface/
+.cache/
+hub/
+
+
+# ── Dataset cache ─────────────────────────────────────────────────────────────
+# HuggingFace Datasets caches arrow files locally after first download.
+# Can be re-downloaded
+~/.cache/huggingface/datasets/
+data/cache/
+*.arrow
+*.arrow.lock
+dataset_dict.json
+
+
+# ── Python bytecode & packaging ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+
+# ── Jupyter / Colab notebooks (optional — uncomment to track .ipynb) ─────────
+# Notebooks often contain large cell outputs (model-generated text, plots).
+# Uncomment the line below to ignore them entirely, or use nbstripout instead.
+# *.ipynb
+.ipynb_checkpoints/
+
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.py
+hf_token.txt
+token.txt
+
+
+# ── Logs & experiment outputs ────────────────────────────────────────────────
+logs/
+runs/
+wandb/
+*.log
+*.out
+tensorboard/
+
+
+# ── OS & editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+
+# ── Misc large files ──────────────────────────────────────────────────────────
+*.zip
+*.tar.gz
+*.h5
+*.hdf5
