@@ -125,6 +125,9 @@ def train_rm(cfg_override=None):
     rm           = RewardModel(backbone)
     rm.to(device)
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # ── Decide which parameters to train ────────────────────────────────
     # Option A (default): train only the scalar classification head.
     #   Very fast, low memory, sufficient for ≥60% accuracy target.
@@ -282,6 +285,47 @@ def train_rm(cfg_override=None):
     torch.save(rm.state_dict(), os.path.join(rm_cfg.save_dir, "rm_state_dict.pt"))
     print(f"[rm] Frozen RM saved to: {rm_cfg.save_dir}")
     print(f"[rm] Final accuracy: {final_acc:.3f}")
+
+    # ── Save reward distribution histograms ──────────────────────────────────
+    import matplotlib
+    matplotlib.use("Agg")          # headless backend — no display needed on Colab
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    os.makedirs("plots", exist_ok=True)
+
+    # Collect r⁺ and r⁻ on the full test set
+    rm.eval()
+    all_r_pos, all_r_neg = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            r_pos = rm(batch["chosen_input_ids"].to(device),
+                    batch["chosen_attention_mask"].to(device)).cpu().float().tolist()
+            r_neg = rm(batch["rejected_input_ids"].to(device),
+                    batch["rejected_attention_mask"].to(device)).cpu().float().tolist()
+            all_r_pos.extend(r_pos)
+            all_r_neg.extend(r_neg)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bins = np.linspace(
+        min(min(all_r_pos), min(all_r_neg)),
+        max(max(all_r_pos), max(all_r_neg)),
+        40
+    )
+    ax.hist(all_r_pos, bins=bins, alpha=0.6, label=r"$r^+$ (chosen)",   color="steelblue")
+    ax.hist(all_r_neg, bins=bins, alpha=0.6, label=r"$r^-$ (rejected)", color="tomato")
+    ax.axvline(np.mean(all_r_pos), color="steelblue", linestyle="--", linewidth=1.5,
+            label=f"mean $r^+$ = {np.mean(all_r_pos):.2f}")
+    ax.axvline(np.mean(all_r_neg), color="tomato",    linestyle="--", linewidth=1.5,
+            label=f"mean $r^-$ = {np.mean(all_r_neg):.2f}")
+    ax.set_xlabel("Reward score", fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_title("Reward Model: Score Distribution on Test Set", fontsize=13)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig("plots/rm_reward_distribution.png", dpi=150)
+    plt.close(fig)
+    print("[rm] Reward distribution plot saved → plots/rm_reward_distribution.png")
 
     return rm, rm_tokenizer
 

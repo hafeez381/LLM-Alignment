@@ -186,6 +186,8 @@ def train_ppo():
     ppo_cfg = cfg.ppo
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[ppo] Device: {device}")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # ── Run sanity checks before touching any real data ──────────────────
     all_pass = ppo_sanity()
@@ -221,11 +223,13 @@ def train_ppo():
 
     train_loader = DataLoader(
         PromptDataset(train_examples, policy_tok, max_prompt_len=512),
-        batch_size=ppo_cfg.prompts_per_step, shuffle=True, num_workers=0,
+        batch_size=ppo_cfg.prompts_per_step, shuffle=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
     )
     test_loader = DataLoader(
         PromptDataset(test_examples, policy_tok, max_prompt_len=512),
-        batch_size=ppo_cfg.prompts_per_step, shuffle=False, num_workers=0,
+        batch_size=ppo_cfg.prompts_per_step, shuffle=False,
+        num_workers=4, pin_memory=True, persistent_workers=True,
     )
     # Infinite iterator over training prompts
     train_iter = _infinite_iter(train_loader)
@@ -316,6 +320,8 @@ def train_dpo():
     dpo_cfg = cfg.dpo
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[dpo] Device: {device}")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # ── Tokenizer + policy ────────────────────────────────────────────────
     policy_tok = load_policy_tokenizer()
@@ -332,11 +338,11 @@ def train_dpo():
 
     train_loader = DataLoader(
         train_ds, batch_size=dpo_cfg.batch_size,
-        shuffle=True, num_workers=0, pin_memory=True,
+        shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True,
     )
     test_loader = DataLoader(
         test_ds, batch_size=dpo_cfg.batch_size,
-        shuffle=False, num_workers=0,
+        shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True,
     )
     print(f"[dpo] Train batches: {len(train_loader):,} | Test: {len(test_loader):,}")
 
@@ -445,6 +451,8 @@ def train_grpo():
     grpo_cfg = cfg.grpo
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[grpo] Device: {device}")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     policy_tok = load_policy_tokenizer()
     rm_tok     = load_rm_tokenizer()
@@ -459,11 +467,13 @@ def train_grpo():
 
     train_loader = DataLoader(
         PromptDataset(train_ex, policy_tok, max_prompt_len=512),
-        batch_size=grpo_cfg.prompts_per_step, shuffle=True, num_workers=0,
+        batch_size=grpo_cfg.prompts_per_step, shuffle=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
     )
     test_loader = DataLoader(
         PromptDataset(test_ex, policy_tok, max_prompt_len=512),
-        batch_size=grpo_cfg.prompts_per_step, shuffle=False, num_workers=0,
+        batch_size=grpo_cfg.prompts_per_step, shuffle=False,
+        num_workers=4, pin_memory=True, persistent_workers=True,
     )
     train_iter = _infinite_iter(train_loader)
 
@@ -471,6 +481,7 @@ def train_grpo():
         [p for p in policy.parameters() if p.requires_grad], lr=2e-4, weight_decay=0.01
     )
     os.makedirs(grpo_cfg.save_dir, exist_ok=True)
+    deg_frac_history = []   # (step, frac_degenerate) pairs
 
     # Running stats for degenerate batch monitoring
     total_batches    = 0
@@ -500,6 +511,7 @@ def train_grpo():
         # If std(r_{b,k}) ≈ 0 for a prompt, all A_{b,k}=0 → zero gradient.
         # Assignment spec: if >30% are degenerate, RM is not discriminating.
         frac_deg = rollout["frac_degenerate"]
+        deg_frac_history.append((step, frac_deg))
         degenerate_count += frac_deg
         total_batches    += 1
         running_frac_deg  = degenerate_count / total_batches
@@ -536,6 +548,35 @@ def train_grpo():
                            f"grpo step={step}")
             policy.train()
 
+    # ── Save degenerate batch fraction plot ───────────────────────────────────
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs("plots", exist_ok=True)
+    method_label = "grpo"
+    steps_list = [s for s, _ in deg_frac_history]
+    deg_list   = [d for _, d in deg_frac_history]
+    window = 10
+    running_mean = [
+        sum(deg_list[max(0, i - window + 1):i + 1]) / (i - max(0, i - window + 1) + 1)
+        for i in range(len(deg_list))
+    ]
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(steps_list, deg_list,     alpha=0.3, color="steelblue", linewidth=1,  label="Per-step")
+    ax.plot(steps_list, running_mean,             color="steelblue", linewidth=2,  label=f"Running mean (window={window})")
+    ax.axhline(0.30, color="tomato", linestyle="--", linewidth=1.5, label="30% warning threshold")
+    ax.set_xlabel("Training step", fontsize=12)
+    ax.set_ylabel("Fraction of degenerate batches", fontsize=12)
+    ax.set_title(f"{method_label.upper()}: Degenerate Batch Fraction Over Training", fontsize=13)
+    ax.set_ylim(0, 1.05)
+    ax.legend()
+    fig.tight_layout()
+    save_path = f"plots/{method_label}_degenerate_batches.png"
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"[{method_label}] Degenerate batch plot saved → {save_path}")
+
     # ── Save ──────────────────────────────────────────────────────────────
     policy.save_pretrained(grpo_cfg.save_dir)
     policy_tok.save_pretrained(grpo_cfg.save_dir)
@@ -561,6 +602,8 @@ def train_rlvr():
     rlvr_cfg = cfg.rlvr
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[rlvr] Device: {device}")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     policy_tok  = load_policy_tokenizer()
     # RLVR starts from the SAME SFT checkpoint as all other methods.
@@ -578,7 +621,7 @@ def train_rlvr():
         train_ds,
         batch_size=rlvr_cfg.prompts_per_step,
         shuffle=True,
-        num_workers=0,
+        num_workers=4, pin_memory=True, persistent_workers=True,
     )
     train_iter = _infinite_iter(train_loader)
 
@@ -587,6 +630,7 @@ def train_rlvr():
         [p for p in policy.parameters() if p.requires_grad], lr=2e-4, weight_decay=0.01
     )
     os.makedirs(rlvr_cfg.save_dir, exist_ok=True)
+    deg_frac_history = []   # (step, frac_degenerate) pairs
 
     # ── Degenerate batch tracking ─────────────────────────────────────────
     total_batches    = 0
@@ -657,6 +701,7 @@ def train_rlvr():
 
         # ── Stats accumulation ────────────────────────────────────────────
         frac_deg       = rollout["frac_degenerate"]
+        deg_frac_history.append((step, frac_deg))
         total_deg_frac += frac_deg
         total_batches  += 1
         running_deg     = total_deg_frac / total_batches
@@ -715,6 +760,35 @@ def train_rlvr():
     print("\n[rlvr] Generating final sample table...")
     samples = generate_sample_table(policy, test_examples, policy_tok, device, n_samples=5)
     print_sample_table(samples)
+
+    # ── Save degenerate batch fraction plot ───────────────────────────────────
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs("plots", exist_ok=True)
+    method_label = "rlvr"
+    steps_list = [s for s, _ in deg_frac_history]
+    deg_list   = [d for _, d in deg_frac_history]
+    window = 10
+    running_mean = [
+        sum(deg_list[max(0, i - window + 1):i + 1]) / (i - max(0, i - window + 1) + 1)
+        for i in range(len(deg_list))
+    ]
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(steps_list, deg_list,     alpha=0.3, color="steelblue", linewidth=1,  label="Per-step")
+    ax.plot(steps_list, running_mean,             color="steelblue", linewidth=2,  label=f"Running mean (window={window})")
+    ax.axhline(0.30, color="tomato", linestyle="--", linewidth=1.5, label="30% warning threshold")
+    ax.set_xlabel("Training step", fontsize=12)
+    ax.set_ylabel("Fraction of degenerate batches", fontsize=12)
+    ax.set_title(f"{method_label.upper()}: Degenerate Batch Fraction Over Training", fontsize=13)
+    ax.set_ylim(0, 1.05)
+    ax.legend()
+    fig.tight_layout()
+    save_path = f"plots/{method_label}_degenerate_batches.png"
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"[{method_label}] Degenerate batch plot saved → {save_path}")
 
     # ── Save ──────────────────────────────────────────────────────────────
     policy.save_pretrained(rlvr_cfg.save_dir)

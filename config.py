@@ -26,7 +26,7 @@ class ModelConfig:
 
     # Load frozen models (π_ref, RM) in 8-bit to halve their VRAM footprint.
     # bitsandbytes 8-bit only works on CUDA; we guard against CPU in loader.py.
-    load_frozen_in_8bit: bool = True
+    load_frozen_in_8bit: bool = False
 
     # bfloat16 preferred over float16: same range as float32, no overflow risk.
     # float16 can NaN with the large logit values LLMs produce.
@@ -106,8 +106,8 @@ class DataConfig:
 @dataclass
 class SFTConfig:
     num_epochs: int = 1
-    batch_size: int = 8
-    grad_accum_steps: int = 4    # effective batch = 8 × 4 = 32
+    batch_size: int = 16
+    grad_accum_steps: int = 2    # effective batch = 16 × 2 = 32
     learning_rate: float = 2e-4  # LoRA adapts far fewer params → higher LR ok
     max_grad_norm: float = 1.0
     warmup_steps: int = 50
@@ -123,7 +123,7 @@ class SFTConfig:
 @dataclass
 class RMConfig:
     num_epochs: int = 1
-    batch_size: int = 8
+    batch_size: int = 16
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
     warmup_steps: int = 30
@@ -149,7 +149,7 @@ class RMConfig:
 @dataclass
 class PPOConfig:
     total_steps: int = 200
-    prompts_per_step: int = 8      # |batch| of prompts sampled per update
+    prompts_per_step: int = 16      # |batch| of prompts sampled per update
     max_new_tokens: int = 128
     beta: float = 0.1              # KL penalty coefficient β in J(θ)
     epsilon: float = 0.2           # clipping range: ρ_t ∈ [1-ε, 1+ε]
@@ -159,7 +159,7 @@ class PPOConfig:
     # Number of gradient update passes over EACH rollout buffer.
     # Each pass uses mini-batches drawn without replacement from the buffer.
     ppo_epochs: int = 4
-    mini_batch_size: int = 4
+    mini_batch_size: int = 8
 
     # PPO full loss: L = -L_clip + c_V·L_V - c_ent·H(π_θ) + c_KL·L_KL
     c_value: float = 0.5       # value loss coefficient
@@ -175,7 +175,7 @@ class PPOConfig:
 @dataclass
 class GRPOConfig:
     total_steps: int = 200
-    prompts_per_step: int = 8
+    prompts_per_step: int = 16
     K: int = 4                 # rollouts per prompt; group size for advantage
     max_new_tokens: int = 128
     beta: float = 0.1
@@ -190,8 +190,8 @@ class GRPOConfig:
 @dataclass
 class DPOConfig:
     num_epochs: int = 1
-    batch_size: int = 8
-    grad_accum_steps: int = 4
+    batch_size: int = 16
+    grad_accum_steps: int = 2
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
     beta: float = 0.1          # temperature β in the DPO loss

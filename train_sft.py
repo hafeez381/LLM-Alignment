@@ -179,6 +179,9 @@ def train_sft(cfg_override=None):
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[sft] Device: {device}")
 
+    torch.backends.cuda.matmul.allow_tf32 = True   # ~10% faster matmuls on A100
+    torch.backends.cudnn.allow_tf32 = True
+
     # ── 1. Load tokenizer ────────────────────────────────────────────────
     tokenizer = load_policy_tokenizer()
     print("[sft] Tokenizer loaded")
@@ -212,6 +215,10 @@ def train_sft(cfg_override=None):
     model.to(device)
     model.train()
     print_model_stats(model, "Policy + LoRA (SFT)")
+
+    model = torch.compile(model, mode="reduce-overhead")
+    # torch.compile fuses CUDA kernels. First step is slow (compilation),
+    # but all subsequent steps are ~20-30% faster on A100.
 
     # ── 4. Optimiser + scheduler ─────────────────────────────────────────
     # Only optimise LoRA parameters (base model weights are frozen by PEFT)
