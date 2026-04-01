@@ -1,12 +1,19 @@
 """
-train_rl.py — RL Training Loop Dispatcher (Tasks C3 & C4)
-==========================================================
+train_rl.py — RL Training Loop Dispatcher (Tasks C3–C6)
+========================================================
 
 Usage:
     python train_rl.py --method ppo
     python train_rl.py --method dpo
+    python train_rl.py --method grpo
+    python train_rl.py --method rlvr
 
-Both methods start from the SFT-merged checkpoint (π_ref).
+All RL methods (ppo, grpo, rlvr) start from the SFT-MERGED checkpoint.
+DPO also starts from the SFT-MERGED checkpoint.
+RLVR MUST start from the plain SFT checkpoint — NOT from a PPO/GRPO/DPO
+checkpoint, even though it uses the same GSM8K data. The HH-RLHF SFT
+policy is the shared π_ref for ALL methods (including RLVR).
+
 DO NOT start from the raw pretrained model — you'd be penalising KL
 divergence from an unaligned model, making KL a meaningless signal.
 
@@ -34,6 +41,26 @@ PSEUDOCODE — DPO:
     d.  Log: loss, pref_acc, z_mean
     e.  Every 25 steps: evaluate on held-out DPO pairs
 4.  Save adapter + merge
+
+PSEUDOCODE — GRPO:
+──────────────────
+1. Load policy (sft_merged + fresh LoRA) ← π_θ, trainable
+2. Load frozen RM                         ← r_ψ, frozen
+3. Create prompt pool dataloader
+4. For step in range(total_steps):
+   a. batch = next(prompt_iter)
+   b. rollout = group_rollout(policy, rm, batch, K=4, ...)
+   c. log degenerate fraction
+   d. metrics = grpo_update(policy, optimizer, rollout)
+   e. Log + eval every eval_every steps
+5. Save + merge
+
+PSEUDOCODE — RLVR:
+──────────────────
+Same as GRPO but:
+   b. reward_fn = make_rlvr_reward_fn(gold_map, policy_tok)
+      rollout = group_rollout(policy, rm=None, reward_fn=reward_fn, batch, K=4, ...)
+   Extra logging: pass@1, format_compliance, credit_assignment_frac
 """
 
 import os
@@ -60,10 +87,95 @@ from data.hh_rlhf import (
     load_hh_rlhf, parse_dataset,
     DPODataset, PromptDataset,
 )
+from data.gsm8k import load_gsm8k, GSM8KDataset
 from alignment.ppo import (
     collect_rollouts, ppo_update, run_sanity_checks as ppo_sanity,
 )
 from alignment.dpo import dpo_loss, evaluate_dpo
+from alignment.grpo import group_rollout, grpo_update
+from alignment.rlvr import (
+    make_rlvr_reward_fn,
+    evaluate_rlvr,
+    compute_credit_assignment_fraction,
+    generate_sample_table,
+    print_sample_table,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_policy_from_sft(device, model_id=None):
+    """Load SFT-merged checkpoint + fresh LoRA → π_θ."""
+    path = model_id or cfg.sft.merged_save_dir
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"SFT merged checkpoint not found: {path}. Run train_sft.py first."
+        )
+    print(f"[train_rl] Loading policy from: {path}")
+    base  = load_policy_base_model(model_id=path)
+    model = apply_lora(base)
+    model.to(device).train()
+    return model
+
+
+def _load_frozen_rm(device):
+    """Load frozen RM from checkpoints/rm/."""
+    rm_path = cfg.rm.save_dir
+    if not os.path.exists(rm_path):
+        raise FileNotFoundError(
+            f"RM checkpoint not found: {rm_path}. Run train_rm.py first."
+        )
+    print(f"[train_rl] Loading frozen RM from: {rm_path}")
+    backbone = load_reward_backbone(model_id=rm_path)
+    rm       = RewardModel(backbone)
+    rm.to(device).eval()
+    for p in rm.parameters():
+        p.requires_grad_(False)
+    return rm
+
+
+def _infinite_iter(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+@torch.no_grad()
+def _eval_rm_score(policy, rm, rm_tok, policy_tok, prompt_loader, device,
+                   step_label, n_batches=5):
+    """Quick held-out eval: mean RM score on greedy responses."""
+    policy.eval()
+    scores = []
+    for i, batch in enumerate(prompt_loader):
+        if i >= n_batches:
+            break
+        prompt_ids  = batch["input_ids"].to(device)
+        prompt_mask = batch["attention_mask"].to(device)
+        raw_prompts = batch["raw_prompt"]
+
+        full_ids = policy.generate(
+            input_ids=prompt_ids, attention_mask=prompt_mask,
+            max_new_tokens=128, do_sample=False,
+            pad_token_id=policy_tok.pad_token_id,
+        )
+        P        = prompt_ids.shape[1]
+        resp_ids = full_ids[:, P:]
+
+        texts = [
+            raw_prompts[j] + " " + policy_tok.decode(resp_ids[j], skip_special_tokens=True)
+            for j in range(resp_ids.shape[0])
+        ]
+        enc = rm_tok(texts, max_length=512, padding=True, truncation=True,
+                     return_tensors="pt").to(device)
+        s   = rm(enc["input_ids"], enc["attention_mask"])
+        scores.extend(s.cpu().tolist())
+
+    mean_s = sum(scores) / max(len(scores), 1)
+    print(f"[eval] {step_label} | mean RM score = {mean_s:.4f} "
+          f"over {len(scores)} responses")
+    policy.train()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,74 +200,46 @@ def train_ppo():
     # We start from sft_merged (not pretrained) so that:
     #   (a) disable_adapter() gives π_ref = SFT policy (correct KL anchor)
     #   (b) the policy already generates coherent text from step 0
-    sft_merged_path = cfg.sft.merged_save_dir
-    if not os.path.exists(sft_merged_path):
-        raise FileNotFoundError(
-            f"SFT merged checkpoint not found at {sft_merged_path}. "
-            "Run train_sft.py first."
-        )
-
-    print(f"[ppo] Loading policy from SFT merged: {sft_merged_path}")
-    base_model = load_policy_base_model(model_id=sft_merged_path)
-    policy     = apply_lora(base_model)   # π_θ with fresh LoRA
-    policy.to(device)
-    policy.train()
+    policy     = _load_policy_from_sft(device)
 
     # ── Value model ───────────────────────────────────────────────────────
     # Freeze backbone, train only the scalar head. More stable for short runs.
     # TODO: try unfreeze + LoRA backbone after establishing a working baseline.
     value_head = load_value_model(freeze_backbone=True)
-    value_head.to(device)
-    value_head.train()
+    value_head.to(device).train()
+
+    # ── Frozen reward model ───────────────────────────────────────────────
+    rm = _load_frozen_rm(device)
 
     print_model_stats(policy,     "Policy + LoRA (PPO)")
     print_model_stats(value_head, "Value Head (frozen backbone)")
-
-    # ── Frozen reward model ───────────────────────────────────────────────
-    rm_backbone = load_reward_backbone()
-    rm          = RewardModel(rm_backbone)
-    rm.to(device)
-    rm.eval()
-    for p in rm.parameters():
-        p.requires_grad_(False)
-    print("[ppo] RM loaded and frozen")
 
     # ── Dataset ───────────────────────────────────────────────────────────
     raw_train, raw_test = load_hh_rlhf()
     train_examples      = parse_dataset(raw_train)
     test_examples       = parse_dataset(raw_test)
 
-    prompt_train_ds = PromptDataset(train_examples, policy_tok, max_prompt_len=512)
-    prompt_test_ds  = PromptDataset(test_examples,  policy_tok, max_prompt_len=512)
-
-    prompt_train_loader = DataLoader(
-        prompt_train_ds,
-        batch_size=ppo_cfg.prompts_per_step,
-        shuffle=True,
-        num_workers=0,
+    train_loader = DataLoader(
+        PromptDataset(train_examples, policy_tok, max_prompt_len=512),
+        batch_size=ppo_cfg.prompts_per_step, shuffle=True, num_workers=0,
     )
-    prompt_test_loader = DataLoader(
-        prompt_test_ds,
-        batch_size=ppo_cfg.prompts_per_step,
-        shuffle=False,
-        num_workers=0,
+    test_loader = DataLoader(
+        PromptDataset(test_examples, policy_tok, max_prompt_len=512),
+        batch_size=ppo_cfg.prompts_per_step, shuffle=False, num_workers=0,
     )
     # Infinite iterator over training prompts
-    def cycle(loader):
-        while True:
-            for batch in loader:
-                yield batch
-    train_iter = cycle(prompt_train_loader)
+    train_iter = _infinite_iter(train_loader)
 
     # ── Optimisers ────────────────────────────────────────────────────────
     # Separate optimisers for policy (LoRA) and value head (v_head only when
     # backbone is frozen). Using one shared optimiser can cause the value
     # head LR to conflict with the policy LoRA LR.
-    policy_params = [p for p in policy.parameters() if p.requires_grad]
-    value_params  = [p for p in value_head.parameters() if p.requires_grad]
-
-    policy_optimizer = AdamW(policy_params, lr=2e-4, weight_decay=0.01)
-    value_optimizer  = AdamW(value_params,  lr=1e-3, weight_decay=0.01)
+    policy_optimizer = AdamW(
+        [p for p in policy.parameters() if p.requires_grad], lr=2e-4, weight_decay=0.01
+    )
+    value_optimizer = AdamW(
+        [p for p in value_head.parameters() if p.requires_grad], lr=1e-3, weight_decay=0.01
+    )
     # Higher LR for value head: it's a simple linear layer starting from near-zero
 
     os.makedirs(ppo_cfg.save_dir, exist_ok=True)
@@ -171,13 +255,11 @@ def train_ppo():
         batch = next(train_iter)
 
         # Temporarily wrap the single batch as a 1-element iterable
-        single_batch_iter = [batch]
-
         rollout_buffer = collect_rollouts(
             policy=policy,
             rm=rm,
             value_head=value_head,
-            prompt_loader=single_batch_iter,
+            prompt_loader=[batch],
             policy_tok=policy_tok,
             rm_tok=rm_tok,
             device=device,
@@ -213,59 +295,17 @@ def train_ppo():
 
         # ── Evaluation ────────────────────────────────────────────────────
         if step % ppo_cfg.eval_every == 0:
-            print(f"\n[ppo] ── Evaluation @ step {step} ──")
-            _eval_ppo(policy, rm, rm_tok, policy_tok, prompt_test_loader, device, step)
+            print(f"\n── Eval @ step {step} ──")
+            _eval_rm_score(policy, rm, rm_tok, policy_tok, test_loader, device,
+                           f"ppo step={step}")
             policy.train()
 
     # ── Save ──────────────────────────────────────────────────────────────
     print(f"\n[ppo] Training done in {time.time()-t0:.0f}s. Saving...")
     policy.save_pretrained(ppo_cfg.save_dir)
     policy_tok.save_pretrained(ppo_cfg.save_dir)
-    merged_path = os.path.join(ppo_cfg.save_dir, "merged")
-    merge_and_save(policy, merged_path, policy_tok)
+    merge_and_save(policy, os.path.join(ppo_cfg.save_dir, "merged"), policy_tok)
     print(f"[ppo] Saved to {ppo_cfg.save_dir}")
-
-
-@torch.no_grad()
-def _eval_ppo(policy, rm, rm_tok, policy_tok, prompt_loader, device, step,
-              n_batches=5):
-    """
-    Quick evaluation: mean RM score on greedy responses from n_batches prompts.
-    A rising RM score over PPO steps is the primary quality signal.
-    """
-    policy.eval()
-    rm.eval()
-    all_scores = []
-
-    for i, batch in enumerate(prompt_loader):
-        if i >= n_batches:
-            break
-        prompt_ids  = batch["input_ids"].to(device)
-        prompt_mask = batch["attention_mask"].to(device)
-        raw_prompts = batch["raw_prompt"]
-
-        full_ids = policy.generate(
-            input_ids=prompt_ids,
-            attention_mask=prompt_mask,
-            max_new_tokens=128,
-            do_sample=False,     # greedy for eval (reproducible)
-            pad_token_id=policy_tok.pad_token_id,
-        )
-        P        = prompt_ids.shape[1]
-        resp_ids = full_ids[:, P:]
-
-        full_texts = [
-            raw_prompts[j] + " " + policy_tok.decode(resp_ids[j], skip_special_tokens=True)
-            for j in range(resp_ids.shape[0])
-        ]
-        enc = rm_tok(full_texts, max_length=512, padding=True, truncation=True,
-                     return_tensors="pt").to(device)
-        scores = rm(enc["input_ids"], enc["attention_mask"])
-        all_scores.extend(scores.cpu().tolist())
-
-    mean_score = sum(all_scores) / max(len(all_scores), 1)
-    print(f"[ppo-eval] step={step} | mean RM score = {mean_score:.4f} "
-          f"over {len(all_scores)} responses")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,19 +319,7 @@ def train_dpo():
 
     # ── Tokenizer + policy ────────────────────────────────────────────────
     policy_tok = load_policy_tokenizer()
-
-    sft_merged_path = cfg.sft.merged_save_dir
-    if not os.path.exists(sft_merged_path):
-        raise FileNotFoundError(
-            f"SFT merged checkpoint not found at {sft_merged_path}. "
-            "Run train_sft.py first."
-        )
-
-    print(f"[dpo] Loading policy from SFT merged: {sft_merged_path}")
-    base_model = load_policy_base_model(model_id=sft_merged_path)
-    policy     = apply_lora(base_model)
-    policy.to(device)
-    policy.train()
+    policy     = _load_policy_from_sft(device)
     print_model_stats(policy, "Policy + LoRA (DPO)")
 
     # ── Dataset ───────────────────────────────────────────────────────────
@@ -405,9 +433,294 @@ def train_dpo():
     print(f"\n[dpo] Training done in {time.time()-t0:.0f}s. Saving...")
     policy.save_pretrained(dpo_cfg.save_dir)
     policy_tok.save_pretrained(dpo_cfg.save_dir)
-    merged_path = os.path.join(dpo_cfg.save_dir, "merged")
-    merge_and_save(policy, merged_path, policy_tok)
+    merge_and_save(policy, os.path.join(dpo_cfg.save_dir, "merged"), policy_tok)
     print(f"[dpo] Saved to {dpo_cfg.save_dir}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRPO training
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_grpo():
+    grpo_cfg = cfg.grpo
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[grpo] Device: {device}")
+
+    policy_tok = load_policy_tokenizer()
+    rm_tok     = load_rm_tokenizer()
+    policy     = _load_policy_from_sft(device)
+    rm         = _load_frozen_rm(device)
+
+    print_model_stats(policy, "Policy + LoRA (GRPO)")
+
+    raw_train, raw_test = load_hh_rlhf()
+    train_ex            = parse_dataset(raw_train)
+    test_ex             = parse_dataset(raw_test)
+
+    train_loader = DataLoader(
+        PromptDataset(train_ex, policy_tok, max_prompt_len=512),
+        batch_size=grpo_cfg.prompts_per_step, shuffle=True, num_workers=0,
+    )
+    test_loader = DataLoader(
+        PromptDataset(test_ex, policy_tok, max_prompt_len=512),
+        batch_size=grpo_cfg.prompts_per_step, shuffle=False, num_workers=0,
+    )
+    train_iter = _infinite_iter(train_loader)
+
+    optimizer = AdamW(
+        [p for p in policy.parameters() if p.requires_grad], lr=2e-4, weight_decay=0.01
+    )
+    os.makedirs(grpo_cfg.save_dir, exist_ok=True)
+
+    # Running stats for degenerate batch monitoring
+    total_batches    = 0
+    degenerate_count = 0.0
+
+    print(f"\n[grpo] Training for {grpo_cfg.total_steps} steps, K={grpo_cfg.K}...")
+    t0 = time.time()
+
+    for step in range(1, grpo_cfg.total_steps + 1):
+        batch = next(train_iter)
+
+        # ── Rollout ────────────────────────────────────────────────────────
+        # group_rollout generates K completions per prompt using π_old,
+        # caches log_probs_old and log_probs_ref, and computes group advantages.
+        rollout = group_rollout(
+            policy=policy,
+            rm=rm,
+            rm_tok=rm_tok,
+            prompt_batch=batch,
+            policy_tok=policy_tok,
+            device=device,
+            grpo_cfg=grpo_cfg,
+            reward_fn=None,    # use learned RM (not verifiable reward)
+        )
+
+        # ── Degenerate batch tracking ─────────────────────────────────────
+        # If std(r_{b,k}) ≈ 0 for a prompt, all A_{b,k}=0 → zero gradient.
+        # Assignment spec: if >30% are degenerate, RM is not discriminating.
+        frac_deg = rollout["frac_degenerate"]
+        degenerate_count += frac_deg
+        total_batches    += 1
+        running_frac_deg  = degenerate_count / total_batches
+
+        # ── Update ────────────────────────────────────────────────────────
+        metrics = grpo_update(
+            policy=policy,
+            optimizer=optimizer,
+            rollout_buffer=rollout,
+            device=device,
+            grpo_cfg=grpo_cfg,
+            use_full_kl=False,    # MC-approx KL (less VRAM)
+        )
+
+        print(
+            f"[grpo] step={step:4d} | "
+            f"rm={rollout['mean_rm']:.3f} | "
+            f"kl={metrics.get('kl_mean',0):.4f} | "
+            f"clip={metrics.get('clip_loss',0):.4f} | "
+            f"ρ={metrics.get('rho_mean',1):.3f} | "
+            f"deg={frac_deg:.2f}(run={running_frac_deg:.2f}) | "
+            f"len={rollout['mean_resp_len']:.0f} | "
+            f"gn={metrics.get('grad_norm',0):.3f} | "
+            f"t={time.time()-t0:.0f}s"
+        )
+
+        if running_frac_deg > 0.30 and step > 10:
+            print(f"[grpo] ⚠ Degenerate fraction {running_frac_deg:.2f} > 0.30. "
+                  f"RM may not discriminate well — check RM accuracy.")
+
+        if step % grpo_cfg.eval_every == 0:
+            print(f"\n── Eval @ step {step} ──")
+            _eval_rm_score(policy, rm, rm_tok, policy_tok, test_loader, device,
+                           f"grpo step={step}")
+            policy.train()
+
+    # ── Save ──────────────────────────────────────────────────────────────
+    policy.save_pretrained(grpo_cfg.save_dir)
+    policy_tok.save_pretrained(grpo_cfg.save_dir)
+    merge_and_save(policy, os.path.join(grpo_cfg.save_dir, "merged"), policy_tok)
+    print(f"[grpo] Done. Saved to {grpo_cfg.save_dir}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RLVR training
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_rlvr():
+    """
+    RLVR = GRPO on GSM8K with r_v ∈ {0,1} instead of a learned RM.
+
+    Key differences from GRPO:
+        - Dataset: GSM8K (math word problems), not HH-RLHF
+        - Reward: verifiable_reward() (exact answer match), not r_ψ(x,y)
+        - Hyperparameters: β=0.05 (less KL penalty; r_v is binary, not continuous)
+        - max_new_tokens=256 (reasoning chains are longer than dialogue)
+        - CRITICAL: initialise from SFT checkpoint, NOT from GRPO/PPO checkpoint
+    """
+    rlvr_cfg = cfg.rlvr
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[rlvr] Device: {device}")
+
+    policy_tok  = load_policy_tokenizer()
+    # RLVR starts from the SAME SFT checkpoint as all other methods.
+    # We do NOT use the GRPO/PPO checkpoint because those were aligned for
+    # HH-RLHF preferences — starting from them would conflate HH alignment
+    # signal with math reasoning signal.
+    policy = _load_policy_from_sft(device)
+    print_model_stats(policy, "Policy + LoRA (RLVR)")
+
+    # ── Dataset ───────────────────────────────────────────────────────────
+    train_examples, test_examples = load_gsm8k()
+
+    train_ds = GSM8KDataset(train_examples, policy_tok, max_prompt_len=256)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=rlvr_cfg.prompts_per_step,
+        shuffle=True,
+        num_workers=0,
+    )
+    train_iter = _infinite_iter(train_loader)
+
+    # ── Optimiser ─────────────────────────────────────────────────────────
+    optimizer = AdamW(
+        [p for p in policy.parameters() if p.requires_grad], lr=2e-4, weight_decay=0.01
+    )
+    os.makedirs(rlvr_cfg.save_dir, exist_ok=True)
+
+    # ── Degenerate batch tracking ─────────────────────────────────────────
+    total_batches    = 0
+    total_deg_frac   = 0.0
+    total_pass       = 0
+    total_scored     = 0
+
+    print(f"\n[rlvr] Training for {rlvr_cfg.total_steps} steps, K={rlvr_cfg.K}...")
+    t0 = time.time()
+
+    for step in range(1, rlvr_cfg.total_steps + 1):
+        batch = next(train_iter)
+
+        # Build gold answer map for this batch's prompts
+        # (group_rollout needs it to compute r_v per completion)
+        gold_map = {
+            batch["raw_prompt"][i]: batch["gold_answer"][i].item()
+            if hasattr(batch["gold_answer"][i], "item")
+            else batch["gold_answer"][i]
+            for i in range(len(batch["raw_prompt"]))
+        }
+        reward_fn = make_rlvr_reward_fn(gold_map, policy_tok)
+
+        # ── Group rollout with verifiable reward ──────────────────────────
+        # Overrides the GRPO config's beta with RLVR's lower beta (0.05).
+        # We pass a modified grpo_cfg proxy by temporarily overriding fields.
+        # Cleaner approach: create a dataclass copy. We do it inline here.
+        class _RLVRGRPOCfg:
+            K              = rlvr_cfg.K
+            max_new_tokens = rlvr_cfg.max_new_tokens
+            beta           = rlvr_cfg.beta
+            epsilon        = rlvr_cfg.epsilon
+            prompts_per_step = rlvr_cfg.prompts_per_step
+
+        rollout = group_rollout(
+            policy=policy,
+            rm=None,              # no learned RM in RLVR
+            rm_tok=None,
+            prompt_batch=batch,
+            policy_tok=policy_tok,
+            device=device,
+            grpo_cfg=_RLVRGRPOCfg(),
+            reward_fn=reward_fn,  # verifiable reward
+        )
+
+        # ── Credit assignment analysis ─────────────────────────────────────
+        # Fraction of response tokens carrying nonzero gradient.
+        # For RLVR: degenerate batches give ZERO gradient to ALL tokens.
+        # Even non-degenerate batches: ALL tokens in a completion get the
+        # same gradient (unlike PPO which has per-token KL signal).
+        # This illustrates PA2 Problem 4.3(b): sparse reward → sparse gradient.
+        credit_frac = compute_credit_assignment_fraction(
+            rollout["response_mask"],
+            rollout["response_lens"],
+            rollout["is_degenerate"],
+            K=rlvr_cfg.K,
+        )
+
+        # ── Update ────────────────────────────────────────────────────────
+        metrics = grpo_update(
+            policy=policy,
+            optimizer=optimizer,
+            rollout_buffer=rollout,
+            device=device,
+            grpo_cfg=_RLVRGRPOCfg(),
+            use_full_kl=False,
+        )
+
+        # ── Stats accumulation ────────────────────────────────────────────
+        frac_deg       = rollout["frac_degenerate"]
+        total_deg_frac += frac_deg
+        total_batches  += 1
+        running_deg     = total_deg_frac / total_batches
+
+        # Track pass rate in training batch (mean reward = mean pass rate)
+        batch_rm = rollout["mean_rm"]
+        total_pass    += batch_rm * rlvr_cfg.K * rlvr_cfg.prompts_per_step
+        total_scored  += rlvr_cfg.K * rlvr_cfg.prompts_per_step
+        running_pass   = total_pass / max(total_scored, 1)
+
+        print(
+            f"[rlvr] step={step:4d} | "
+            f"train_pass={batch_rm:.3f} | "
+            f"run_pass={running_pass:.3f} | "
+            f"kl={metrics.get('kl_mean',0):.4f} | "
+            f"clip={metrics.get('clip_loss',0):.4f} | "
+            f"deg={frac_deg:.2f}(run={running_deg:.2f}) | "
+            f"credit={credit_frac:.2f} | "
+            f"len={rollout['mean_resp_len']:.0f} | "
+            f"gn={metrics.get('grad_norm',0):.3f} | "
+            f"t={time.time()-t0:.0f}s"
+        )
+
+        if running_deg > 0.30 and step > 50:
+            print(f"[rlvr] ⚠ Degenerate fraction {running_deg:.2f} > 0.30. "
+                  f"Possible causes: (1) prompts too hard (all wrong) early in training, "
+                  f"(2) answer extractor too strict. Check extract_answer on recent outputs.")
+
+        # ── Evaluation ────────────────────────────────────────────────────
+        if step % rlvr_cfg.eval_every == 0:
+            print(f"\n── RLVR Eval @ step {step} ──")
+            eval_m = evaluate_rlvr(
+                policy=policy,
+                test_examples=test_examples,
+                policy_tok=policy_tok,
+                device=device,
+                max_new_tokens=rlvr_cfg.max_new_tokens,
+                n_eval=200,
+            )
+            print(
+                f"[rlvr-eval] pass@1={eval_m['pass_at_1']:.3f} | "
+                f"format_compliance={eval_m['format_compliance']:.3f} | "
+                f"extractable={eval_m['frac_extractable']:.3f} | "
+                f"mean_len={eval_m['mean_resp_len']:.0f}\n"
+            )
+            if eval_m["pass_at_1"] == 0.0 and step > 100:
+                print(
+                    "[rlvr] ⚠ pass@1 still 0.0 after 100 steps. Check:\n"
+                    "  (1) Is extract_answer finding '#### N' in gold solutions?\n"
+                    "  (2) Does the prompt format match SFT training format?\n"
+                    "  (3) Is max_new_tokens=256 (reasoning needs more space than 128)?"
+                )
+            policy.train()
+
+    # ── Final sample table ─────────────────────────────────────────────────
+    print("\n[rlvr] Generating final sample table...")
+    samples = generate_sample_table(policy, test_examples, policy_tok, device, n_samples=5)
+    print_sample_table(samples)
+
+    # ── Save ──────────────────────────────────────────────────────────────
+    policy.save_pretrained(rlvr_cfg.save_dir)
+    policy_tok.save_pretrained(rlvr_cfg.save_dir)
+    merge_and_save(policy, os.path.join(rlvr_cfg.save_dir, "merged"), policy_tok)
+    print(f"[rlvr] Done. Saved to {rlvr_cfg.save_dir}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,11 +746,6 @@ if __name__ == "__main__":
         # Faster matmul on A100/T4; minor accuracy trade-off acceptable for LLM training
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if args.method == "ppo":
-        train_ppo()
-    elif args.method == "dpo":
-        train_dpo()
-    elif args.method == "grpo":
-        raise NotImplementedError("GRPO: implement in Phase C5 (alignment/grpo.py)")
-    elif args.method == "rlvr":
-        raise NotImplementedError("RLVR: implement in Phase C6 (alignment/rlvr.py)")
+    dispatch = {"ppo": train_ppo, "dpo": train_dpo,
+                "grpo": train_grpo, "rlvr": train_rlvr}
+    dispatch[args.method]()
