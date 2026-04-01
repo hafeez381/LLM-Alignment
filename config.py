@@ -70,7 +70,7 @@ class LoRAConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class TokenizerConfig:
-    max_seq_len: int = 1024  # prompt + response ≤ 1024 tokens total
+    max_seq_len: int = 512  # prompt + response ≤ 1024 tokens total
 
     # Left-padding for the POLICY tokenizer.
     # WHY: In autoregressive generation, we batch prompts of different lengths.
@@ -92,12 +92,12 @@ class TokenizerConfig:
 @dataclass
 class DataConfig:
     dataset_id: str = "Anthropic/hh-rlhf"
-    subset: str = "harmless-base"
+    subset: str = "default"
 
     # Set to an integer to use a smaller subset for fast iteration on Colab.
     # Set to None to use the full ~42 k train / ~2.3 k test split.
-    train_subset_size: Optional[int] = None  # e.g. 5000 for quick runs
-    test_subset_size: Optional[int] = None   # e.g. 500
+    train_subset_size: Optional[int] = 42000  # e.g. 5000 for quick runs
+    test_subset_size: Optional[int] = 2300   # e.g. 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ class SFTConfig:
 @dataclass
 class RMConfig:
     num_epochs: int = 1
-    batch_size: int = 16
+    batch_size: int = 4
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
     warmup_steps: int = 30

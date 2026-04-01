@@ -64,12 +64,16 @@ Same as GRPO but:
 """
 
 import os
+import sys
 import argparse
 import time
 import torch
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+sys.stdout.reconfigure(line_buffering=True)
 
 from config import cfg
 from model.loader import (
@@ -251,7 +255,8 @@ def train_ppo():
     t0 = time.time()
 
     # ── Training loop ─────────────────────────────────────────────────────
-    for step in range(1, ppo_cfg.total_steps + 1):
+    for step in tqdm(range(1, ppo_cfg.total_steps + 1),
+                     desc="PPO", unit="step", dynamic_ncols=True):
 
         # Phase A: Rollout
         # We wrap prompt_train_loader into a single-batch loader for collect_rollouts
@@ -375,7 +380,8 @@ def train_dpo():
     rstep  = 0   # raw batch steps
 
     for epoch in range(dpo_cfg.num_epochs):
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"DPO epoch {epoch+1}/{dpo_cfg.num_epochs}",
+                          unit="batch", dynamic_ncols=True):
             rstep += 1
 
             chosen_ids      = batch["chosen_input_ids"].to(device)
@@ -490,7 +496,8 @@ def train_grpo():
     print(f"\n[grpo] Training for {grpo_cfg.total_steps} steps, K={grpo_cfg.K}...")
     t0 = time.time()
 
-    for step in range(1, grpo_cfg.total_steps + 1):
+    for step in tqdm(range(1, grpo_cfg.total_steps + 1),
+                     desc="GRPO", unit="step", dynamic_ncols=True):
         batch = next(train_iter)
 
         # ── Rollout ────────────────────────────────────────────────────────
@@ -641,7 +648,8 @@ def train_rlvr():
     print(f"\n[rlvr] Training for {rlvr_cfg.total_steps} steps, K={rlvr_cfg.K}...")
     t0 = time.time()
 
-    for step in range(1, rlvr_cfg.total_steps + 1):
+    for step in tqdm(range(1, rlvr_cfg.total_steps + 1),
+                     desc="RLVR", unit="step", dynamic_ncols=True):
         batch = next(train_iter)
 
         # Build gold answer map for this batch's prompts

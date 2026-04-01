@@ -36,13 +36,13 @@ echo "    ✓ packages installed"
 echo "[2/4] Checking HuggingFace authentication..."
 if [ -n "$HF_TOKEN" ]; then
     echo "    Found HF_TOKEN env var — logging in..."
-    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
-    echo "    ✓ logged in"
+    python - <<EOF
+import huggingface_hub
+huggingface_hub.login(token="$HF_TOKEN", add_to_git_credential=False)
+print("    ✓ logged in")
+EOF
 else
-    echo "    HF_TOKEN not set."
-    echo "    To authenticate, run:"
-    echo "      import os; os.environ['HF_TOKEN'] = 'hf_xxx'"
-    echo "    or re-run this script with HF_TOKEN=hf_xxx bash setup_colab.sh"
+    echo "    HF_TOKEN not set. Set it via Colab Secrets and re-run."
 fi
 
 # ── 3. GPU sanity check ───────────────────────────────────────────────────

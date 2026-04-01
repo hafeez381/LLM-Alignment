@@ -30,12 +30,16 @@ Key masking invariant:
 """
 
 import os
+import sys
 import math
 import time
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
+from tqdm import tqdm
+
+sys.stdout.reconfigure(line_buffering=True)
 
 from config import cfg
 from data.hh_rlhf import load_hh_rlhf, parse_dataset, SFTDataset
@@ -216,10 +220,6 @@ def train_sft(cfg_override=None):
     model.train()
     print_model_stats(model, "Policy + LoRA (SFT)")
 
-    model = torch.compile(model, mode="reduce-overhead")
-    # torch.compile fuses CUDA kernels. First step is slow (compilation),
-    # but all subsequent steps are ~20-30% faster on A100.
-
     # ── 4. Optimiser + scheduler ─────────────────────────────────────────
     # Only optimise LoRA parameters (base model weights are frozen by PEFT)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -248,7 +248,8 @@ def train_sft(cfg_override=None):
     t0 = time.time()
 
     for epoch in range(sft_cfg.num_epochs):
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"SFT epoch {epoch+1}/{sft_cfg.num_epochs}",
+                          unit="batch", dynamic_ncols=True):
             raw_step += 1
 
             input_ids      = batch["input_ids"].to(device)       # (B, L)

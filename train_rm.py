@@ -29,12 +29,16 @@ CRITICAL NOTE on r⁺ and r⁻ computation:
 """
 
 import os
+import sys
 import time
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+sys.stdout.reconfigure(line_buffering=True)
 
 from config import cfg
 from data.hh_rlhf import load_hh_rlhf, parse_dataset, RMDataset
@@ -115,6 +119,8 @@ def train_rm(cfg_override=None):
     To train backbone layers too (adds ~2M LoRA params):
         # Uncomment the lines marked TODO below and set train_head_only=False
     """
+    import os
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     rm_cfg = cfg.rm if cfg_override is None else cfg_override
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[rm] Device: {device}")
@@ -131,7 +137,7 @@ def train_rm(cfg_override=None):
     # ── Decide which parameters to train ────────────────────────────────
     # Option A (default): train only the scalar classification head.
     #   Very fast, low memory, sufficient for ≥60% accuracy target.
-    train_head_only = True
+    train_head_only = False
 
     if train_head_only:
         # Freeze ALL backbone layers; only score head is trainable
@@ -142,10 +148,23 @@ def train_rm(cfg_override=None):
                 param.requires_grad_(False)
         print("[rm] Training HEAD ONLY (backbone frozen)")
     else:
-        # TODO (Optional): apply LoRA to backbone and train adapters + head
-        # from model.lora_setup import apply_lora
-        # rm.backbone = apply_lora(rm.backbone, cfg.lora)
-        pass
+        from peft import LoraConfig, get_peft_model, TaskType
+
+        lora_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=cfg.lora.r,
+            lora_alpha=cfg.lora.lora_alpha,
+            target_modules=cfg.lora.target_modules,
+            lora_dropout=cfg.lora.lora_dropout,
+            bias=cfg.lora.bias,
+        )
+        rm.backbone = get_peft_model(rm.backbone, lora_config)
+        rm.backbone.print_trainable_parameters()
+
+        # Ensure score head stays trainable (PEFT can reset it)
+        for name, param in rm.backbone.named_parameters():
+            if "score" in name:
+                param.requires_grad_(True)
 
     rm.train()
     print_model_stats(rm, "RewardModel")
@@ -194,7 +213,8 @@ def train_rm(cfg_override=None):
     t0 = time.time()
 
     for epoch in range(rm_cfg.num_epochs):
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"RM epoch {epoch+1}/{rm_cfg.num_epochs}",
+                          unit="batch", dynamic_ncols=True):
             global_step += 1
 
             # Move to device
