@@ -96,8 +96,8 @@ class DataConfig:
 
     # Set to an integer to use a smaller subset for fast iteration on Colab.
     # Set to None to use the full ~42 k train / ~2.3 k test split.
-    train_subset_size: Optional[int] = 42000  # e.g. 5000 for quick runs
-    test_subset_size: Optional[int] = 2300   # e.g. 500
+    train_subset_size: Optional[int] = None  # e.g. 5000 for quick runs
+    test_subset_size: Optional[int] = None   # e.g. 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────

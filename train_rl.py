@@ -72,6 +72,9 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import json
+from eval import ResourceTracker
+_resource_tracker = ResourceTracker()
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -109,6 +112,10 @@ from alignment.rlvr import (
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _save_resource_log():
+    os.makedirs("plots", exist_ok=True)
+    with open("plots/resource_log.json", "w") as f:
+        json.dump(_resource_tracker.records, f, indent=2)
 
 def _load_policy_from_sft(device, model_id=None):
     """Load SFT-merged checkpoint + fresh LoRA → π_θ."""
@@ -253,6 +260,7 @@ def train_ppo():
     os.makedirs(ppo_cfg.save_dir, exist_ok=True)
     print(f"\n[ppo] Starting PPO training for {ppo_cfg.total_steps} steps...")
     t0 = time.time()
+    _resource_tracker.start("PPO")
 
     # ── Training loop ─────────────────────────────────────────────────────
     for step in tqdm(range(1, ppo_cfg.total_steps + 1),
@@ -311,6 +319,8 @@ def train_ppo():
 
     # ── Save ──────────────────────────────────────────────────────────────
     print(f"\n[ppo] Training done in {time.time()-t0:.0f}s. Saving...")
+    _resource_tracker.stop("PPO", n_steps=ppo_cfg.total_steps)
+    _save_resource_log()
     policy.save_pretrained(ppo_cfg.save_dir)
     policy_tok.save_pretrained(ppo_cfg.save_dir)
     merge_and_save(policy, os.path.join(ppo_cfg.save_dir, "merged"), policy_tok)
@@ -331,6 +341,7 @@ def train_dpo():
     # ── Tokenizer + policy ────────────────────────────────────────────────
     policy_tok = load_policy_tokenizer()
     policy     = _load_policy_from_sft(device)
+    policy.enable_input_require_grads()
     print_model_stats(policy, "Policy + LoRA (DPO)")
 
     # ── Dataset ───────────────────────────────────────────────────────────
@@ -376,6 +387,7 @@ def train_dpo():
         print("[dpo] ⚠ pref_acc >> 0.50 at init. Check that π_ref == π_θ baseline.")
 
     t0     = time.time()
+    _resource_tracker.start("DPO")
     gstep  = 0   # optimizer steps
     rstep  = 0   # raw batch steps
 
@@ -443,6 +455,8 @@ def train_dpo():
 
     # ── Save ──────────────────────────────────────────────────────────────
     print(f"\n[dpo] Training done in {time.time()-t0:.0f}s. Saving...")
+    _resource_tracker.stop("DPO", n_steps=len(train_loader) * dpo_cfg.num_epochs)
+    _save_resource_log()
     policy.save_pretrained(dpo_cfg.save_dir)
     policy_tok.save_pretrained(dpo_cfg.save_dir)
     merge_and_save(policy, os.path.join(dpo_cfg.save_dir, "merged"), policy_tok)
@@ -495,6 +509,7 @@ def train_grpo():
 
     print(f"\n[grpo] Training for {grpo_cfg.total_steps} steps, K={grpo_cfg.K}...")
     t0 = time.time()
+    _resource_tracker.start("GRPO")
 
     for step in tqdm(range(1, grpo_cfg.total_steps + 1),
                      desc="GRPO", unit="step", dynamic_ncols=True):
@@ -585,6 +600,8 @@ def train_grpo():
     print(f"[{method_label}] Degenerate batch plot saved → {save_path}")
 
     # ── Save ──────────────────────────────────────────────────────────────
+    _resource_tracker.stop("GRPO", n_steps=grpo_cfg.total_steps)
+    _save_resource_log()
     policy.save_pretrained(grpo_cfg.save_dir)
     policy_tok.save_pretrained(grpo_cfg.save_dir)
     merge_and_save(policy, os.path.join(grpo_cfg.save_dir, "merged"), policy_tok)
@@ -647,6 +664,7 @@ def train_rlvr():
 
     print(f"\n[rlvr] Training for {rlvr_cfg.total_steps} steps, K={rlvr_cfg.K}...")
     t0 = time.time()
+    _resource_tracker.start("RLVR")
 
     for step in tqdm(range(1, rlvr_cfg.total_steps + 1),
                      desc="RLVR", unit="step", dynamic_ncols=True):
@@ -799,6 +817,8 @@ def train_rlvr():
     print(f"[{method_label}] Degenerate batch plot saved → {save_path}")
 
     # ── Save ──────────────────────────────────────────────────────────────
+    _resource_tracker.stop("RLVR", n_steps=rlvr_cfg.total_steps)
+    _save_resource_log()
     policy.save_pretrained(rlvr_cfg.save_dir)
     policy_tok.save_pretrained(rlvr_cfg.save_dir)
     merge_and_save(policy, os.path.join(rlvr_cfg.save_dir, "merged"), policy_tok)

@@ -84,6 +84,8 @@ class ValueHead(nn.Module):
 
         # Near-zero initialisation — see module docstring
         nn.init.normal_(self.v_head.weight, std=0.01)
+        self.v_head = self.v_head.to(torch.bfloat16)
+
 
     def forward(
         self,
