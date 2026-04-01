@@ -7,7 +7,7 @@ PSEUDOCODE:
 load_policy_tokenizer(model_id)
   → Load SmolLM2 tokenizer
   → Set pad_token = eos_token (model has no dedicated pad token)
-  → Set padding_side = 'left'  (critical for autoregressive generation)
+  → Set padding_side = 'left'  (for autoregressive generation)
   → Return tokenizer
 
 load_rm_tokenizer(model_id)

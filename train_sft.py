@@ -88,7 +88,8 @@ def evaluate_perplexity(
 ) -> float:
     """
     Compute perplexity on a held-out set (greedy, no sampling).
-
+    Perplexity (PPL) is the exponentiated average negative
+    log-likelihood:
     PPL = exp(mean CE loss over all response tokens in the held-out set)
 
     Interpretation:

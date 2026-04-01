@@ -69,7 +69,7 @@ def load_hh_rlhf(data_cfg=None):
     train_data = raw["train"]
     test_data  = raw["test"]
 
-    # Optional subsetting for fast Colab iteration
+    # optional subsetting for fast Colab iteration
     if data_cfg.train_subset_size is not None:
         train_data = train_data.select(range(data_cfg.train_subset_size))
     if data_cfg.test_subset_size is not None:

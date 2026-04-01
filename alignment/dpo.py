@@ -2,34 +2,6 @@
 alignment/dpo.py — Direct Preference Optimisation (Task C4)
 ============================================================
 
-Mathematical Derivation (connecting to PA2 Problem 3.1)
-────────────────────────────────────────────────────────
-Starting from the reward reparameterisation (PA2 eq. 4):
-    r_ψ(x, y) = β·log[π*(y|x) / π_ref(y|x)] + β·log Z(x)
-
-Substitute into the Bradley-Terry preference model (eq. 5):
-    P(y⁺ ≻ y⁻ | x) = σ(r_ψ(x,y⁺) - r_ψ(x,y⁻))
-                    = σ(β·log[π*(y⁺|x)/π_ref(y⁺|x)] + β·log Z(x)
-                       - β·log[π*(y⁻|x)/π_ref(y⁻|x)] - β·log Z(x))
-
-The two log Z(x) terms CANCEL — this is the key algebraic step that
-makes DPO work without ever computing the intractable partition function.
-
-    P(y⁺ ≻ y⁻ | x) = σ(β·log[π*(y⁺|x)/π_ref(y⁺|x)]
-                       - β·log[π*(y⁻|x)/π_ref(y⁻|x)])
-
-Replacing π* with the trainable π_θ and taking negative log-likelihood:
-    L_DPO(θ) = -E_{(x,y⁺,y⁻)} [log σ(z)]
-
-where:
-    z = β·(Δ_θ - Δ_ref)
-    Δ_θ   = log π_θ(y⁺|x)  - log π_θ(y⁻|x)      ← trainable, grad flows
-    Δ_ref  = log π_ref(y⁺|x) - log π_ref(y⁻|x)   ← frozen, no grad
-
-Key identity:
-    log π(y|x) = Σ_{t ∈ response} log π(y_t | x, y_{<t})
-    ← SUM of per-token log-probs, ONLY over response tokens
-
 PSEUDOCODE:
 ────────────
 dpo_loss(policy, batch):

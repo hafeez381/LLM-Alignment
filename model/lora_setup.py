@@ -110,7 +110,10 @@ def freeze_model(model: torch.nn.Module) -> torch.nn.Module:
 @contextmanager
 def reference_model_ctx(peft_model: torch.nn.Module):
     """
-    Context manager that temporarily disables LoRA adapters on π_θ.
+    Deploying two discrete copies of a language model to compute the 
+    KL divergence penalty drastically increases the required VRAM footprint.
+
+    Context manager temporarily disables LoRA adapters on π_θ.
 
     While inside this context, the model behaves as π_ref (the SFT-merged
     base weights, without any of the RL-trained LoRA delta).
@@ -125,13 +128,15 @@ def reference_model_ctx(peft_model: torch.nn.Module):
         aside. The context manager restores the adapters atomically on exit,
         so no risk of forgetting to re-enable them.
 
-    CRITICAL: The underlying base model must be the SFT-MERGED checkpoint
+    The underlying base model must be the SFT-MERGED checkpoint
     (i.e., trained via merge_and_save() after SFT). If it's the raw pretrained
     checkpoint, disable_adapter() gives you pretrained, not SFT — wrong π_ref!
     """
+    # Store training state
     training_was = peft_model.training
     try:
         peft_model.eval()
+        # Temporarily remove the LoRA delta (B.A)
         with peft_model.disable_adapter():
             # Inside here: model == π_ref (SFT base, LoRA delta disabled)
             with torch.no_grad():

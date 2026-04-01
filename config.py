@@ -1,13 +1,8 @@
 """
-config.py — Central Configuration for PA2 LLM Alignment (AI623)
+config.py — Central Configuration
 ================================================================
 All hyperparameters live here as frozen dataclasses.
-Import `cfg` wherever you need configuration — no magic numbers scattered
-across files.
-
-Design principle: every number you see in any other script should trace back
-to a field here. That way, changing one value (e.g., beta) propagates
-everywhere automatically.
+Import `cfg` for configurations needed.
 """
 
 from dataclasses import dataclass, field
@@ -49,7 +44,7 @@ class LoRAConfig:
 
     # α = 16: scaling factor. Effective weight delta = (α/r) * B·A.
     # Keeping α/r = 2 is a common default that prevents adapter outputs from
-    # being too small at init (where B·A ≈ 0).
+    # being too small at init (where B·A ≈ 0) also preventoing vanishing gradients.
     lora_alpha: int = 16
 
     # Only adapt Q and V projection matrices.
