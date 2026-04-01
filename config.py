@@ -92,7 +92,7 @@ class TokenizerConfig:
 @dataclass
 class DataConfig:
     dataset_id: str = "Anthropic/hh-rlhf"
-    subset: str = "default"
+    subset: str = "harmless-base"
 
     # Set to an integer to use a smaller subset for fast iteration on Colab.
     # Set to None to use the full ~42 k train / ~2.3 k test split.

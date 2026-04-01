@@ -64,7 +64,7 @@ def load_hh_rlhf(data_cfg=None):
         data_cfg = cfg.data
 
     print(f"[data] Loading {data_cfg.dataset_id} ({data_cfg.subset})...")
-    raw = load_dataset(data_cfg.dataset_id, data_cfg.subset)
+    raw = load_dataset(data_cfg.dataset_id, data_dir=data_cfg.subset)
 
     train_data = raw["train"]
     test_data  = raw["test"]
