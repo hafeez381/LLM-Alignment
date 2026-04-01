@@ -210,7 +210,7 @@ class RLVRConfig:
     max_new_tokens: int = 256   # 2× PPO/GRPO — reasoning chains are longer
     beta: float = 0.05          # lower β: reward signal is verifiable, less hack risk
     epsilon: float = 0.2
-    eval_every: int = 25
+    eval_every: int = 100
     save_dir: str = "checkpoints/rlvr"
     gsm8k_dataset_id: str = "openai/gsm8k"
 

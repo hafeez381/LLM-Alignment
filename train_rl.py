@@ -765,7 +765,7 @@ def train_rlvr():
                 policy_tok=policy_tok,
                 device=device,
                 max_new_tokens=rlvr_cfg.max_new_tokens,
-                n_eval=200,
+                n_eval=50,
             )
             print(
                 f"[rlvr-eval] pass@1={eval_m['pass_at_1']:.3f} | "
