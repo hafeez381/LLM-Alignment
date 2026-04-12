@@ -38,6 +38,7 @@ import json
 import torch
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
+from tqdm import tqdm
 
 from model.lora_setup import reference_model_ctx
 
@@ -134,40 +135,64 @@ def compute_win_rate(
 
     aligned_model.eval()
     sft_model.eval()
-
-    wins        = 0
-    r_aligned_all, r_sft_all = [], []
-    len_aligned_all, len_sft_all = [], []
-
     examples = test_examples[:n_eval]
-    for ex in examples:
-        prompt = ex["prompt"]
+    batch_size = 16   # process 16 prompts at once — saturates A100 well
 
-        # Greedy decode from both models
-        resp_aligned = _greedy_decode(aligned_model, policy_tok, prompt,
-                                      max_new_tokens, device)
-        resp_sft     = _greedy_decode(sft_model,     policy_tok, prompt,
-                                      max_new_tokens, device)
+    def batch_decode(model, exs, label="decode"):
+        """Greedy-decode a list of examples in mini-batches."""
+        all_responses = []
+        for i in tqdm(range(0, len(exs), batch_size),
+                      desc=f"  {label}", unit="batch", leave=False, dynamic_ncols=True):
+            batch   = exs[i : i + batch_size]
+            prompts = [e["prompt"] for e in batch]
+            enc = policy_tok(
+                prompts, max_length=512, truncation=True,
+                padding=True, return_tensors="pt"
+            ).to(device)
+            out = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=policy_tok.pad_token_id,
+                eos_token_id=policy_tok.eos_token_id,
+            )
+            P = enc["input_ids"].shape[1]
+            for j in range(len(batch)):
+                resp = policy_tok.decode(out[j][P:], skip_special_tokens=True).strip()
+                all_responses.append(resp)
+        return all_responses
 
-        # Score both with the frozen RM
-        r_a = _rm_score_text(rm, rm_tok, prompt, resp_aligned, device)
-        r_s = _rm_score_text(rm, rm_tok, prompt, resp_sft,     device)
+    def batch_score(prompts, responses):
+        """Score (prompt, response) pairs in mini-batches with the RM."""
+        scores = []
+        for i in range(0, len(prompts), batch_size):
+            texts = [
+                prompts[i + j] + " " + responses[i + j]
+                for j in range(min(batch_size, len(prompts) - i))
+            ]
+            enc = rm_tok(
+                texts, max_length=512, padding=True,
+                truncation=True, return_tensors="pt"
+            ).to(device)
+            s = rm(enc["input_ids"], enc["attention_mask"])
+            scores.extend(s.cpu().float().tolist())
+        return scores
 
-        if r_a > r_s:
-            wins += 1
-        r_aligned_all.append(r_a)
-        r_sft_all.append(r_s)
-        len_aligned_all.append(len(resp_aligned.split()))
-        len_sft_all.append(len(resp_sft.split()))
+    prompts      = [e["prompt"] for e in examples]
+    resp_aligned = batch_decode(aligned_model, examples, label="aligned decode")
+    resp_sft     = batch_decode(sft_model,     examples, label="sft decode")
+    r_aligned    = batch_score(prompts, resp_aligned)
+    r_sft        = batch_score(prompts, resp_sft)
 
-    n = len(examples)
+    wins = sum(1 for a, s in zip(r_aligned, r_sft) if a > s)
+    n    = len(examples)
     return {
-        "win_rate":        wins / n,
-        "mean_r_aligned":  sum(r_aligned_all) / n,
-        "mean_r_sft":      sum(r_sft_all) / n,
-        "mean_len_aligned":sum(len_aligned_all) / n,
-        "mean_len_sft":    sum(len_sft_all) / n,
-        "n_eval":          n,
+        "win_rate":         wins / n,
+        "mean_r_aligned":   sum(r_aligned) / n,
+        "mean_r_sft":       sum(r_sft) / n,
+        "mean_len_aligned": sum(len(r.split()) for r in resp_aligned) / n,
+        "mean_len_sft":     sum(len(r.split()) for r in resp_sft) / n,
+        "n_eval":           n,
     }
 
 
@@ -210,7 +235,7 @@ def compute_kl(
     policy.eval()
     kl_values = []
 
-    for ex in test_examples[:n_eval]:
+    for ex in tqdm(test_examples[:n_eval], desc="KL", unit="prompt", dynamic_ncols=True):
         prompt = ex["prompt"]
         enc = policy_tok(
             prompt, max_length=512, truncation=True, return_tensors="pt"
@@ -457,11 +482,11 @@ def run_full_eval(
     print(header)
     print("-" * len(header))
 
-    for method, model in method_models.items():
+    for method, model in tqdm(method_models.items(), desc="Methods", unit="method", dynamic_ncols=True):
         if model is None or method == "SFT":
             continue
 
-        print(f"[eval] Computing win-rate for {method}...")
+        print(f"\n[eval] Computing win-rate for {method}...")
         wr_metrics = compute_win_rate(
             aligned_model=model,
             sft_model=sft_model,

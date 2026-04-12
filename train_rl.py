@@ -62,7 +62,6 @@ Same as GRPO but:
       rollout = group_rollout(policy, rm=None, reward_fn=reward_fn, batch, K=4, ...)
    Extra logging: pass@1, format_compliance, credit_assignment_frac
 """
-
 import os
 import sys
 import argparse

@@ -37,6 +37,8 @@ import sys
 import json
 import torch
 
+sys.stdout.reconfigure(line_buffering=True)
+
 from config import cfg
 from model.loader import (
     load_policy_tokenizer,
@@ -157,7 +159,7 @@ def main():
         rm=rm, rm_tok=rm_tok, policy_tok=policy_tok,
         test_examples=test_examples,
         resource_tracker=tracker,
-        n_eval=200,
+        n_eval=50,
         n_sample_prompts=5,
         output_dir="plots",
         device=device,
